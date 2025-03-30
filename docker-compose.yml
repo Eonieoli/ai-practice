@@ -1,0 +1,24 @@
+services:
+  ai-server:
+    build: .
+    container_name: ai-server
+    volumes:
+      - ./models:/app/models
+      - ./temp:/app/temp
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - MODEL_NAME=llava-next-vicuna-7b
+      - MODEL_DEVICE=cuda
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
