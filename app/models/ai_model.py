@@ -1,206 +1,368 @@
 # app/models/ai_model.py
 import os
+import json
+import time
 import logging
 import torch
 from pathlib import Path
-from app.core.config import settings
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Optional, Any, Union, Tuple
 from PIL import Image
-import json
+import requests
+from io import BytesIO
+import re
+import numpy as np
+
+# 멀티모달 LLM 관련 라이브러리
+from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-class LlavaNextModel:
+class AIImageAnalyzer:
     """
-    LLaVA-NeXT 모델 래퍼 클래스
+    LLaVA-NeXT 멀티모달 LLM을 사용한 이미지 분석 클래스
     """
-    def __init__(self):
+    
+    def __init__(self, model_name: Optional[str] = None, device: Optional[str] = None):
+        """
+        AIImageAnalyzer 클래스 초기화
+        
+        Args:
+            model_name: 사용할 모델 이름
+            device: 추론에 사용할 장치 ('cuda' 또는 'cpu')
+        """
+        self.model_name = model_name or settings.MODEL_NAME
+        self.device_name = device or settings.DEVICE
+        self.device = torch.device(self.device_name if torch.cuda.is_available() and self.device_name == 'cuda' else 'cpu')
+        
+        # 모델과 프로세서 초기화
         self.model = None
         self.processor = None
-        self.device = settings.MODEL_DEVICE
-        self.model_loaded = False
         
-    def load_model(self) -> None:
+        # 모델 로드 상태 추적
+        self.is_model_loaded = False
+        self.last_load_time = None
+        
+        logger.info(f"AIImageAnalyzer initialized. Model: {self.model_name}, Device: {self.device}")
+    
+    def load_model(self, force_reload: bool = False) -> None:
         """
-        LLaVA-NeXT 모델 로드
+        모델 및 프로세서 로드
+        
+        Args:
+            force_reload: 이미 로드된 모델이라도 강제로 다시 로드할지 여부
         """
+        if self.is_model_loaded and not force_reload:
+            logger.info("Model already loaded. Skipping.")
+            return
+        
+        logger.info(f"Loading model {self.model_name}...")
+        load_start_time = time.time()
+        
         try:
-            logger.info(f"Loading LLaVA-NeXT model on {self.device}...")
+            # 4비트 양자화 설정 (VRAM 사용량 감소)
+            if self.device_name == 'cuda':
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                )
+            else:
+                bnb_config = None
             
-            # 모델이 GPU를 사용할 수 있는지 확인
-            if self.device == "cuda" and not torch.cuda.is_available():
-                logger.warning("CUDA is not available. Switching to CPU.")
-                self.device = "cpu"
-            
-            # transformers에서 모델 및 프로세서 로드
-            from transformers import AutoProcessor, LlavaNextForConditionalGeneration
-            
-            model_name_or_path = settings.MODEL_NAME
-            
-            # 로컬 경로에 모델이 있는지 확인
-            local_model_path = settings.MODEL_DIR / model_name_or_path
-            model_path = str(local_model_path) if local_model_path.exists() else model_name_or_path
-            
-            # 모델 및 프로세서 로드
-            self.processor = AutoProcessor.from_pretrained(model_path)
-            self.model = LlavaNextForConditionalGeneration.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                device_map=self.device
+            # 모델 로드
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16 if self.device_name == 'cuda' else None,
+                device_map="auto" if self.device_name == 'cuda' else None,
+                quantization_config=bnb_config if self.device_name == 'cuda' else None,
             )
             
-            self.model_loaded = True
-            logger.info("LLaVA-NeXT model loaded successfully")
-        
+            # 프로세서 로드
+            self.processor = AutoProcessor.from_pretrained(self.model_name)
+            
+            # 모델 로드 상태 업데이트
+            self.is_model_loaded = True
+            self.last_load_time = time.time()
+            
+            load_time = time.time() - load_start_time
+            logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
+            
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
             raise
     
-    def analyze_image(self, image: Image.Image) -> Dict[str, Any]:
+    def download_image(self, image_url: str) -> Image.Image:
         """
-        이미지 분석 및 평가 수행
+        URL에서 이미지 다운로드
         
         Args:
-            image: PIL Image 객체
+            image_url: 다운로드할 이미지 URL
             
         Returns:
-            Dict: 분석 결과
+            PIL Image 객체
         """
-        if not self.model_loaded:
-            self.load_model()
-        
-        # 평가 기준 프롬프트 생성
-        prompt = """
-        당신은 사진의 전문적인 평가자입니다. 다음 6가지 측면에서 이 사진을 분석하고 평가해주세요:
-        1. 구도(composition): 프레이밍, 구성 요소의 배치, 시각적 균형 등을 평가
-        2. 선명도(sharpness): 이미지의 초점과 세부 묘사의 선명함을 평가
-        3. 노이즈(noise): 이미지의 입자감이나 디지털 노이즈 수준을 평가
-        4. 노출(exposure): 밝기, 대비, 하이라이트와 그림자의 디테일을 평가
-        5. 색감(color harmony): 색상의 조화, 채도, 색온도의 적절성을 평가
-        6. 심미성(aesthetics): 전반적인 시각적 매력과 예술적 가치를 평가
-        
-        각 항목에 대해 0-10점 척도로 점수를 매기고, 왜 그런 점수를 주었는지 설명해주세요.
-        또한 각 항목별로 개선할 수 있는 팁을 제공해주세요.
-        
-        마지막으로 전체 평가 점수와 종합적인 평가를 제공하고, 이미지에서 감지된 주요 요소들을 태그로 알려주세요.
-        
-        JSON 형식으로 응답해주세요. 다음과 같은 구조여야 합니다:
-        {
-            "composition": {"score": float, "explanation": string, "improvement_tips": [string]},
-            "sharpness": {"score": float, "explanation": string, "improvement_tips": [string]},
-            "noise": {"score": float, "explanation": string, "improvement_tips": [string]},
-            "exposure": {"score": float, "explanation": string, "improvement_tips": [string]},
-            "color_harmony": {"score": float, "explanation": string, "improvement_tips": [string]},
-            "aesthetics": {"score": float, "explanation": string, "improvement_tips": [string]},
-            "overall_score": float,
-            "overall_assessment": string,
-            "tags": [string]
-        }
-        """
-        
         try:
-            # 이미지 및 프롬프트 처리
-            inputs = self.processor(text=prompt, images=image, return_tensors="pt").to(self.device)
+            logger.info(f"Downloading image from {image_url}")
+            response = requests.get(image_url, stream=True)
+            response.raise_for_status()
             
-            # 추론 실행
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=1024,
-                do_sample=False
-            )
+            # 이미지 로드
+            img = Image.open(BytesIO(response.content))
             
-            # 출력 디코딩
-            generated_text = self.processor.decode(output[0], skip_special_tokens=True)
+            # RGBA 이미지를 RGB로 변환 (알파 채널 제거)
+            if img.mode == 'RGBA':
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])  # 알파 채널을 마스크로 사용
+                img = background
             
-            # JSON 추출 (모델이 프롬프트와 함께 응답할 수 있으므로 JSON 부분만 추출)
-            json_start = generated_text.find('{')
-            json_end = generated_text.rfind('}') + 1
+            logger.info(f"Image downloaded successfully. Size: {img.size}, Mode: {img.mode}")
+            return img
             
-            if json_start != -1 and json_end != -1:
-                json_str = generated_text[json_start:json_end]
-                try:
-                    analysis_result = json.loads(json_str)
-                    return analysis_result
-                except json.JSONDecodeError:
-                    # JSON 파싱 실패 시 텍스트 응답을 구조화된 형식으로 변환 시도
-                    logger.warning("Failed to parse JSON from model output, attempting to structure it manually")
-                    return self._structure_text_response(generated_text)
-            else:
-                logger.warning("No JSON found in model output, attempting to structure it manually")
-                return self._structure_text_response(generated_text)
-                
         except Exception as e:
-            logger.error(f"Error during image analysis: {str(e)}")
+            logger.error(f"Error downloading image: {str(e)}")
             raise
     
-    def _structure_text_response(self, text: str) -> Dict[str, Any]:
+    def analyze_image(
+        self, 
+        image_url: str, 
+        custom_prompt: Optional[str] = None, 
+        categories: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
         """
-        모델이 JSON 형식으로 응답하지 않을 경우 텍스트 응답을 구조화
+        이미지 분석 실행
         
         Args:
-            text: 모델 출력 텍스트
+            image_url: 분석할 이미지 URL
+            custom_prompt: 사용자 정의 프롬프트 (선택 사항)
+            categories: 평가할 카테고리 목록 (선택 사항)
             
         Returns:
-            Dict: 구조화된 결과
+            분석 결과 딕셔너리
         """
-        # 기본 응답 템플릿
-        result = {
-            "composition": {"score": 5.0, "explanation": "분석 실패", "improvement_tips": ["자동 분석 실패"]},
-            "sharpness": {"score": 5.0, "explanation": "분석 실패", "improvement_tips": ["자동 분석 실패"]},
-            "noise": {"score": 5.0, "explanation": "분석 실패", "improvement_tips": ["자동 분석 실패"]},
-            "exposure": {"score": 5.0, "explanation": "분석 실패", "improvement_tips": ["자동 분석 실패"]},
-            "color_harmony": {"score": 5.0, "explanation": "분석 실패", "improvement_tips": ["자동 분석 실패"]},
-            "aesthetics": {"score": 5.0, "explanation": "분석 실패", "improvement_tips": ["자동 분석 실패"]},
-            "overall_score": 5.0,
-            "overall_assessment": "자동 분석에 실패했습니다. 모델 응답을 구조화할 수 없습니다.",
-            "tags": ["분석실패"]
-        }
+        # 모델이 로드되지 않았다면 로드
+        if not self.is_model_loaded:
+            self.load_model()
         
-        # 텍스트에서 각 항목에 대한 정보 추출 시도
-        categories = ["composition", "sharpness", "noise", "exposure", "color_harmony", "aesthetics"]
+        # 시작 시간 기록
+        start_time = time.time()
+        
+        try:
+            # 이미지 다운로드
+            image = self.download_image(image_url)
+            
+            # 평가 프롬프트 준비
+            prompt = custom_prompt or settings.EVALUATION_PROMPT
+            
+            # 특정 카테고리만 평가하도록 프롬프트 수정
+            if categories:
+                valid_categories = [cat for cat in categories if cat in settings.EVALUATION_CATEGORIES]
+                
+                if not valid_categories:
+                    logger.warning(f"No valid categories provided. Using all categories.")
+                else:
+                    # 프롬프트에서 선택한 카테고리만 언급하도록 수정
+                    category_text = "\n".join([
+                        f"- {cat.replace('_', ' ').title()}: " + 
+                        next((line.split(':')[1].strip() for line in prompt.split('\n') 
+                             if line.strip().startswith(f"- {cat.replace('_', ' ').title()}")), "")
+                        for cat in valid_categories
+                    ])
+                    
+                    # 새 프롬프트 생성
+                    prompt_parts = prompt.split("Return your evaluation")
+                    if len(prompt_parts) >= 2:
+                        base_prompt = prompt_parts[0]
+                        json_instructions = prompt_parts[1]
+                        
+                        # 새 카테고리 목록으로 프롬프트 재구성
+                        new_prompt = (
+                            f"{base_prompt.split('in the following categories')[0]} "
+                            f"in the following categories, providing a score from 1 to 10 for each category "
+                            f"and a brief explanation:\n\n{category_text}\n\n"
+                            f"Return your evaluation{json_instructions}"
+                        )
+                        prompt = new_prompt
+            
+            logger.info(f"Prepared evaluation prompt with {len(prompt)} characters")
+            
+            # 입력 생성
+            inputs = self.processor(
+                text=prompt,
+                images=image,
+                return_tensors="pt",
+            ).to(self.device)
+            
+            # 생성 설정
+            generation_config = {
+                "max_new_tokens": settings.MAX_NEW_TOKENS,
+                "do_sample": False,  # greedy decoding
+                "temperature": 0.1,  # 결정적인 출력을 위해 낮은 온도 사용
+            }
+            
+            # 추론 실행
+            with torch.no_grad():
+                output = self.model.generate(
+                    **inputs,
+                    **generation_config
+                )
+            
+            # 출력 디코딩
+            decoded_output = self.processor.decode(output[0], skip_special_tokens=True)
+            
+            # 프롬프트 제거하여 응답만 추출
+            response = decoded_output[len(prompt):]
+            
+            # JSON 데이터 추출 시도
+            try:
+                # JSON 형식 문자열 찾기
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                    result = json.loads(json_str)
+                else:
+                    # JSON을 찾지 못한 경우 텍스트 파싱 시도
+                    logger.warning("JSON not found in model output. Attempting to parse manually.")
+                    result = self._parse_evaluation_text(response)
+            except Exception as json_error:
+                logger.error(f"Error parsing JSON from model output: {str(json_error)}")
+                logger.info(f"Raw model output: {response}")
+                result = self._parse_evaluation_text(response)
+            
+            # 처리 시간 계산
+            processing_time = time.time() - start_time
+            result["processing_time"] = processing_time
+            
+            logger.info(f"Image analysis completed in {processing_time:.2f} seconds")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error analyzing image: {str(e)}")
+            raise
+    
+    def _parse_evaluation_text(self, text: str) -> Dict[str, Any]:
+        """
+        모델이 JSON을 반환하지 않을 경우 텍스트에서 평가 결과 파싱
+        
+        Args:
+            text: 모델이 생성한 텍스트 응답
+            
+        Returns:
+            파싱된 평가 결과 딕셔너리
+        """
+        result = {}
+        categories = settings.EVALUATION_CATEGORIES
+        scores = []
         
         for category in categories:
-            # 카테고리 관련 텍스트 찾기
-            cat_index = text.lower().find(category.lower())
-            if cat_index != -1:
-                # 다음 카테고리 시작 위치 또는 텍스트 끝
-                next_cat_index = len(text)
-                for next_cat in categories:
-                    if next_cat != category:
-                        next_idx = text.lower().find(next_cat.lower(), cat_index + len(category))
-                        if next_idx != -1 and next_idx < next_cat_index:
-                            next_cat_index = next_idx
+            # 카테고리 이름 변환 (snake_case -> Title Case)
+            category_title = category.replace('_', ' ').title()
+            
+            # 정규식으로 카테고리 점수 찾기 시도
+            score_pattern = rf'{category_title}[^\d]*(\d+(?:\.\d+)?)'
+            score_match = re.search(score_pattern, text, re.IGNORECASE)
+            
+            # 설명 찾기 시도
+            explanation_pattern = rf'{category_title}[^\d]*\d+(?:\.\d+)?[^\n\.]*(.*?)(?=\n\n|\n[A-Z]|$)'
+            explanation_match = re.search(explanation_pattern, text, re.IGNORECASE | re.DOTALL)
+            
+            if score_match:
+                score = float(score_match.group(1))
+                scores.append(score)
+                explanation = explanation_match.group(1).strip() if explanation_match else "No explanation provided."
                 
-                # 카테고리 관련 텍스트 추출
-                category_text = text[cat_index:next_cat_index].strip()
-                
-                # 점수 추출 시도
-                import re
-                score_match = re.search(r'(\d+(\.\d+)?)/10|score:?\s*(\d+(\.\d+)?)', category_text, re.IGNORECASE)
-                if score_match:
-                    score_str = score_match.group(1) if score_match.group(1) else score_match.group(3)
-                    try:
-                        result[category]["score"] = float(score_str)
-                    except (ValueError, TypeError):
-                        pass
-                
-                # 설명 추출
-                explanation_text = category_text.replace(category, '', 1).strip()
-                if explanation_text:
-                    result[category]["explanation"] = explanation_text[:200]  # 너무 길지 않게 자름
+                result[category] = {
+                    "score": min(max(score, 1.0), 10.0),  # 1-10 범위로 제한
+                    "explanation": explanation
+                }
+            else:
+                logger.warning(f"Could not find score for {category}")
         
-        # 전체 평가 점수 추출 시도
-        overall_match = re.search(r'overall.*?(\d+(\.\d+)?)/10|overall.*?score:?\s*(\d+(\.\d+)?)', text, re.IGNORECASE)
-        if overall_match:
-            overall_str = overall_match.group(1) if overall_match.group(1) else overall_match.group(3)
-            try:
-                result["overall_score"] = float(overall_str)
-            except (ValueError, TypeError):
-                pass
+        # 전체 점수와 피드백
+        if scores:
+            result["overall_score"] = round(sum(scores) / len(scores), 1)
+        else:
+            result["overall_score"] = 5.0
         
-        # 전체 평가 텍스트 추출 시도
-        overall_idx = text.lower().find('overall')
-        if overall_idx != -1:
-            result["overall_assessment"] = text[overall_idx:overall_idx+200].strip()
+        # 전체 피드백 찾기 시도
+        feedback_patterns = [
+            r"(?:Overall|Summary|Conclusion)(?:[^\.]*)\.(.*?)(?=\n\n|\n[A-Z]|$)",
+            r"(?:종합|요약|결론)(?:[^\.]*)\.(.*?)(?=\n\n|\n[가-힣]|$)"
+        ]
+        
+        for pattern in feedback_patterns:
+            feedback_match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+            if feedback_match:
+                result["overall_feedback"] = feedback_match.group(1).strip()
+                break
+        else:
+            # 패턴 일치 항목을 찾지 못한 경우 마지막 단락 사용
+            paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+            result["overall_feedback"] = paragraphs[-1] if paragraphs else "No overall feedback provided."
         
         return result
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """
+        모델 정보 반환
+        
+        Returns:
+            모델 상태 및 정보를 포함하는 딕셔너리
+        """
+        info = {
+            "model_name": self.model_name,
+            "device": str(self.device),
+            "is_loaded": self.is_model_loaded,
+            "last_load_time": self.last_load_time
+        }
+        
+        # 모델이 로드된 경우 추가 정보 포함
+        if self.is_model_loaded and self.model:
+            # 모델 메모리 사용량 추정
+            if self.device_name == 'cuda' and torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / (1024 ** 3)  # GB 단위
+                memory_reserved = torch.cuda.memory_reserved() / (1024 ** 3)    # GB 단위
+                info["memory"] = {
+                    "allocated_gb": round(memory_allocated, 2),
+                    "reserved_gb": round(memory_reserved, 2)
+                }
+            
+            # 모델 크기 (파라미터 수)
+            param_count = sum(p.numel() for p in self.model.parameters())
+            info["parameters"] = param_count
+            info["parameters_millions"] = round(param_count / 1_000_000, 2)
+        
+        return info
+    
+    def unload_model(self) -> None:
+        """모델 언로드 (메모리 해제)"""
+        if self.is_model_loaded:
+            logger.info("Unloading model from memory")
+            
+            # 모델과 프로세서 참조 제거
+            del self.model
+            del self.processor
+            
+            # CUDA 캐시 정리 (CUDA 사용 시)
+            if self.device_name == 'cuda' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # 상태 업데이트
+            self.model = None
+            self.processor = None
+            self.is_model_loaded = False
+            
+            logger.info("Model unloaded successfully")
+
+
+# 싱글톤 인스턴스
+_analyzer_instance = None
+
+def get_analyzer() -> AIImageAnalyzer:
+    """싱글톤 AIImageAnalyzer 인스턴스 반환"""
+    global _analyzer_instance
+    if _analyzer_instance is None:
+        _analyzer_instance = AIImageAnalyzer()
+    return _analyzer_instance
